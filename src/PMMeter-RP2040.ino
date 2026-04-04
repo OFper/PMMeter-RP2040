@@ -26,9 +26,6 @@ PMSData pms = {0, 0, 0, false};
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial) {
-    ;
-  }
 
   Serial.println("PMMeter-RP2040 starting...");
 
