@@ -2,15 +2,32 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <sh1106.h>
+#include <DHT.h>
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET    -1
 #define OLED_ADDRESS  0x3C
 
+#define DHT_PIN 7
+#define DHT_TYPE DHT11
+#define BATTERY_PIN 26
+#define BATTERY_DIVIDER_RATIO 2.0f
+#define ADC_MAX_VALUE 4095.0f
+#define ADC_REF_VOLTAGE 3.3f
+#define BATTERY_MIN_VOLTAGE 3.00f
+#define BATTERY_MAX_VOLTAGE 4.20f
+#define BATTERY_SAMPLES 8
+
 static uint8_t oledBuffer[SCREEN_WIDTH * SCREEN_HEIGHT / 8];
 sh1106 display(SCREEN_WIDTH, SCREEN_HEIGHT);
 bool displayOk = false;
+
+float temperature = NAN;
+float humidity = NAN;
+float batteryVoltage = 0.0f;
+unsigned long lastSensorUpdateMs = 0;
+const unsigned long SENSOR_UPDATE_INTERVAL_MS = 2000;
 
 // PMS5003 on UART pins GP0=RX, GP1=TX
 // Serial1 is the hardware UART for these pins on RP2040.
@@ -23,6 +40,7 @@ struct PMSData {
 };
 
 PMSData pms = {0, 0, 0, false};
+DHT dht(DHT_PIN, DHT_TYPE);
 
 void setup() {
   Serial.begin(115200);
@@ -30,6 +48,9 @@ void setup() {
   Serial.println("PMMeter-RP2040 starting...");
 
   Wire.begin();
+  analogReadResolution(12);
+  pinMode(BATTERY_PIN, INPUT);
+  dht.begin();
 
   if (display.setup(Wire, OLED_ADDRESS, OLED_RESET, oledBuffer) != 0) {
     Serial.println("OLED init failed");
@@ -54,6 +75,8 @@ void setup() {
   }
 
   Serial1.begin(9600);
+  updateEnvironmentalSensors();
+  drawDisplay(pms);
 }
 
 bool readPMSFrame(PMSData &data) {
@@ -124,46 +147,96 @@ bool readPMSFrame(PMSData &data) {
   return false;
 }
 
+float readBatteryVoltage() {
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < BATTERY_SAMPLES; i++) {
+    sum += analogRead(BATTERY_PIN);
+    delay(5);
+  }
+  float average = sum / (float)BATTERY_SAMPLES;
+  return average * (ADC_REF_VOLTAGE / ADC_MAX_VALUE) * BATTERY_DIVIDER_RATIO;
+}
+
+void updateEnvironmentalSensors() {
+  float newTemp = dht.readTemperature();
+  float newHum = dht.readHumidity();
+
+  if (!isnan(newTemp) && !isnan(newHum)) {
+    temperature = newTemp;
+    humidity = newHum;
+    char debug[64];
+    snprintf(debug, sizeof(debug), "DHT11: T=%.1fC H=%.1f%%", temperature, humidity);
+    Serial.println(debug);
+  } else {
+    Serial.println("DHT11 read failed");
+  }
+
+  batteryVoltage = readBatteryVoltage();
+  char battDebug[64];
+  snprintf(battDebug, sizeof(battDebug), "Battery: %.2f V", batteryVoltage);
+  Serial.println(battDebug);
+}
+
+float batteryPercent() {
+  float pct = (batteryVoltage - BATTERY_MIN_VOLTAGE) / (BATTERY_MAX_VOLTAGE - BATTERY_MIN_VOLTAGE) * 100.0f;
+  if (pct < 0.0f) pct = 0.0f;
+  if (pct > 100.0f) pct = 100.0f;
+  return pct;
+}
+
 void drawDisplay(const PMSData &data) {
   if (!displayOk) {
     return;
   }
 
   display.clear();
+  display.setTextColor(1);
 
+  // Battery status
+  display.setTextSize(1);
+  display.setCursor(0, 12);
+  display.print("BAT");
+  display.setTextSize(2);
+  display.setCursor(0, 24);
+  display.print(batteryPercent(), 0);
+  display.print("%");
+
+  // PM2.5 value
+  display.setTextSize(1);
+  display.setCursor(78, 12);
+  display.print("PM2.5");
+  display.setTextSize(2);
+  display.setCursor(78, 24);
   if (data.valid) {
-    display.setTextSize(1);
-    display.setTextColor(1);
-    display.setCursor(0, 12);
-    display.print("PM1.0:");
-    display.setTextSize(2);
-    display.setCursor(70, 10);
-    display.print(data.pm1_0);
-    display.setTextSize(1);
-    display.print(" ug/m3");
-
-    display.setTextSize(1);
-    display.setCursor(0, 30);
-    display.print("PM2.5:");
-    display.setTextSize(2);
-    display.setCursor(70, 28);
     display.print(data.pm2_5);
-    display.setTextSize(1);
-    display.print(" ug/m3");
-
-    display.setTextSize(1);
-    display.setCursor(0, 48);
-    display.print("PM10:");
-    display.setTextSize(2);
-    display.setCursor(70, 46);
-    display.print(data.pm10_0);
-    display.setTextSize(1);
-    display.print(" ug/m3");
   } else {
+    display.print("--");
+  }
+
+  // Separator line
+  display.drawFastHLine(0, 46, SCREEN_WIDTH, 1);
+
+  // Temperature / Humidity
+  display.setTextSize(1);
+  if (!isnan(temperature) && !isnan(humidity)) {
+    display.setCursor(0, 52);
+    display.print("TEMP ");
+    display.print(temperature, 1);
+    display.print("C");
+
+    display.setCursor(72, 52);
+    display.print("HUM ");
+    display.print(humidity, 1);
+    display.print("%");
+  } else {
+    display.setCursor(0, 52);
+    display.print("DHT11 error");
+  }
+
+  if (!data.valid) {
     display.setTextSize(1);
-    display.setTextColor(1);
-    display.setCursor(0, 12);
-    display.println("Waiting for PMS5003 data...");
+    display.setCursor(0, 36);
+    display.print("Waiting for PMS5003 data...");
   }
 
   display.display();
@@ -171,6 +244,12 @@ void drawDisplay(const PMSData &data) {
 
 void loop() {
   if (readPMSFrame(pms)) {
+    drawDisplay(pms);
+  }
+
+  if (millis() - lastSensorUpdateMs >= SENSOR_UPDATE_INTERVAL_MS) {
+    lastSensorUpdateMs = millis();
+    updateEnvironmentalSensors();
     drawDisplay(pms);
   }
 }
